@@ -131,7 +131,7 @@ GET  /health
 | M0 | 确认 `mc-core`/`mc-store` 公开 API 可进程内调用 | ✅ |
 | M1 | 进程内跑通 transform，输出 m[0]/m[1]/tail | ✅ |
 | M2 | Rust adapter HTTP + Python provider 插件 + 映射往返 | ✅ |
-| M3 | 切到 subc daemon 形态，adapter 作为 consumer 调 ck-mc | 🔄 进行中 |
+| M3 | 切到 subc daemon 形态，adapter 作为 consumer 调 ck-mc | ✅ |
 | M4 | `ctx_reduce` / `ctx_expand` / `ctx_search` 工具注册 | ⬜ |
 | M5 | 自动更新流水线（备份 + 编译 + 原子切换） | ⬜ |
 
@@ -143,6 +143,17 @@ action=HARD  materialize_reason=first_render  frozen_units=2
 [1] user  <session-history-since>(no new content ...)</>   ← m[1]
 [2..] 原始 tail
 ```
+
+### M3 实测结果（subc daemon）
+
+```
+GET /health        → { mode:"subc", module_id:"magic-context", harness:"astrbot" }
+POST /v1/transform → 200, 83 ms, action=HARD, reason=first_render
+                     ck_messages = m[0] + m[1] + 3 条原始 tail
+```
+
+adapter 已不再依赖上游源码（只依赖 `subc-client-rs` / `subc-protocol`），
+编译时间从 54s 降到 13s；`mc-upstream` 的 `magic-context/` 目录不再是构建前提。
 
 ### M2 实测结果（HTTP + 映射）
 

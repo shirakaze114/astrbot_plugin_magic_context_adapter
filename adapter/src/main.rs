@@ -1,7 +1,9 @@
-//! mc-adapter: AstrBot 与 Magic Context 之间的本地 HTTP 适配层。
+//! mc-adapter: AstrBot 与 Magic Context（ck-mc）之间的路由层。
 //!
-//! 只做协议转发：接收 CK v2 transform 请求，调用 mc-module 的 transform，
-//! 把结果原样返回。不做任何压缩/丢弃策略决策（策略在 mc 内部）。
+//! 职责只有一件：把 AstrBot 插件发来的请求，经 subc wire 转发给运行在
+//! ck-subc daemon 下的 `magic-context` 模块，再把响应原样返回。
+//!
+//! 这里不做任何策略判断（不决定丢什么、不降档、不压缩），策略全部在 ck-mc 内部。
 
 use std::{
     net::SocketAddr,
@@ -17,15 +19,18 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
-use mc_module::transform;
-use mc_store::single_store_domain::{create_test_context_db, SqliteContextDomain};
-use mc_store::McStore;
 use serde_json::{json, Value};
+use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
+use subc_protocol::{BindIdentity, RouteTarget};
+
+/// daemon 里注册的模块 id（见 ~/.config/cortexkit/subc.jsonc 的 modules 键）
+const MODULE_ID: &str = "magic-context";
+/// 我们作为 host 的身份名
+const HARNESS: &str = "astrbot";
 
 struct App {
-    store: Arc<McStore>,
-    store_dir: PathBuf,
+    consumer: Arc<SubcConsumer>,
+    project_root: PathBuf,
     started_at_ms: u128,
 }
 
@@ -36,35 +41,20 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn descriptor(dir: &PathBuf) -> StorageDescriptor {
-    StorageDescriptor {
-        module_id: "magic-context".to_string(),
-        storage_namespace: "mc_cache".to_string(),
-        isolation: Isolation::Module,
-        backend: StorageBackend::Sqlite {
-            path: dir.join("store.db").to_string_lossy().into_owned(),
-        },
-    }
-}
-
-/// 构造要返回给调用方的响应：transform 的完整 JSON + 原生消息。
-fn transform_response(result: &transform::TransformResponse) -> Value {
-    match serde_json::to_value(result) {
-        Ok(v) => v,
-        Err(e) => json!({ "status": "error", "error": format!("serialize response: {e}") }),
-    }
-}
-
 async fn health(State(app): State<Arc<App>>) -> impl IntoResponse {
     Json(json!({
         "ok": true,
         "service": "mc-adapter",
         "version": env!("CARGO_PKG_VERSION"),
-        "store_dir": app.store_dir.to_string_lossy(),
+        "mode": "subc",
+        "module_id": MODULE_ID,
+        "harness": HARNESS,
+        "project_root": app.project_root.to_string_lossy(),
         "uptime_ms": now_ms().saturating_sub(app.started_at_ms),
     }))
 }
 
+/// 把请求体原样转发给 ck-mc，响应原样返回。
 async fn do_transform(
     State(app): State<Arc<App>>,
     body: String,
@@ -76,48 +66,48 @@ async fn do_transform(
         )
     })?;
 
-    let request: transform::TransformRequest =
-        serde_json::from_value(raw).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "status": "error", "error": format!("invalid transform request: {e}") })),
-            )
-        })?;
+    // 会话身份：mc 用它区分记忆/历史空间
+    let session = raw
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("astrbot-default")
+        .to_string();
 
-    let project_dir = app.store_dir.to_string_lossy().into_owned();
-    let ctx = transform::ProducerContext {
-        project_path: "git:astrbot",
-        note_project_path: "git:astrbot",
-        project_directory: &project_dir,
-        history_budget_tokens: 60_000.0,
-        memory_budget_tokens: 8_000.0,
-        user_profile_budget_tokens: 4_000.0,
-        memory_enabled: true,
-        inject_docs: false,
-        temporal_awareness: true,
-        now_ms: now_ms() as i64,
-        execute_threshold_percentage: 65.0,
-        protected_tokens_floor: 16_000,
-        protected_tokens_provenance: "derived",
-        compaction_enabled: true,
-        smart_drops: true,
-        protected_tools: Default::default(),
-        cache_ttl: "5m".into(),
-        cache_ttl_provenance: mc_module::config::CacheTtlProvenance::Default,
-        cache_ttl_policy: None,
-        model_key: None,
-        observed_last_response_at_ms: None,
-        guidance_date: None,
-        historian_active: false,
-        wrapup_active: false,
-        caveman_english_word_rules: true,
+    let identity = BindIdentity::new(app.project_root.clone(), HARNESS, session.clone());
+    let target = RouteTarget::ToolProvider {
+        module_id: MODULE_ID.to_string(),
     };
 
-    match transform::transform(&app.store, &request, &ctx) {
-        Ok(result) => Ok(Json(transform_response(&result))),
-        Err(e) => Err((
+    let payload = serde_json::to_vec(&raw).map_err(|e| {
+        (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "status": "error", "error": format!("transform failed: {e:?}") })),
+            Json(json!({ "status": "error", "error": format!("encode: {e}") })),
+        )
+    })?;
+
+    match app
+        .consumer
+        .call(target, identity, payload, CallOptions::default())
+        .await
+    {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => Ok(Json(v)),
+            Err(e) => Err((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "status": "error",
+                    "error": format!("module returned non-JSON: {e}"),
+                    "session_id": session,
+                })),
+            )),
+        },
+        Err(e) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "status": "error",
+                "error": format!("subc call failed: {e}"),
+                "session_id": session,
+            })),
         )),
     }
 }
@@ -135,20 +125,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8317);
-    let store_dir = PathBuf::from(
-        std::env::var("MC_STORE_DIR").unwrap_or_else(|_| "./data".to_string()),
-    );
-    std::fs::create_dir_all(&store_dir)?;
 
-    let store = McStore::open(&descriptor(&store_dir))?;
-    // transform 需要 context.db 作为 ContextDomain：生产环境由 host 提供，
-    // 这里我们从 upstream 自带的 schema 快照创建并挂载。
-    let context_path = store_dir.join("context.db");
-    create_test_context_db(&context_path)?;
-    store.install_context_domain(Arc::new(SqliteContextDomain::open(&context_path)?));
+    // mc 以 project 为单位组织记忆；AstrBot 场景用固定根，保证跨会话一致
+    let project_root = PathBuf::from(
+        std::env::var("MC_PROJECT_ROOT").unwrap_or_else(|_| "/root/data/mc-adapter".to_string()),
+    );
+
+    let consumer = SubcConsumer::connect_default(ConsumerOptions::default()).await?;
+    tracing::info!(
+        "mc-adapter connected to subc daemon (module={MODULE_ID}, harness={HARNESS})"
+    );
+
     let app = Arc::new(App {
-        store: Arc::new(store),
-        store_dir: store_dir.clone(),
+        consumer: Arc::new(consumer),
+        project_root,
         started_at_ms: now_ms(),
     });
 
@@ -158,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(app);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    tracing::info!("mc-adapter listening on http://{addr} (store: {})", store_dir.display());
+    tracing::info!("mc-adapter listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
     Ok(())
