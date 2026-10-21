@@ -23,6 +23,8 @@ use serde_json::{json, Value};
 use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+mod historian;
+
 /// daemon 里注册的模块 id（见 ~/.config/cortexkit/subc.jsonc 的 modules 键）
 const MODULE_ID: &str = "magic-context";
 /// 我们作为 host 的身份名
@@ -138,9 +140,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Arc::new(App {
         consumer: Arc::new(consumer),
-        project_root,
+        project_root: project_root.clone(),
         started_at_ms: now_ms(),
     });
+
+    // historian 认领循环：默认关闭。
+    // 发布版 ck-mc-alpha.22464bf2 尚未开放 historian.pending/claim/complete
+    // （实测返回 unrecognized_request_shape），开启只会空转刷错误日志。
+    // 上游开放后设置 MC_HISTORIAN_ENABLED=1 + MC_LLM_* 即可启用。
+    let historian_enabled = std::env::var("MC_HISTORIAN_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if historian_enabled {
+        match historian::llm_config_from_env() {
+            Some(llm) => {
+                tracing::info!("historian worker enabled (model={}, every 20s)", llm.model);
+                historian::spawn(
+                    app.consumer.clone(),
+                    project_root.clone(),
+                    llm,
+                    std::time::Duration::from_secs(20),
+                );
+            }
+            None => tracing::warn!(
+                "MC_HISTORIAN_ENABLED set but MC_LLM_BASE_URL / MC_LLM_MODEL missing"
+            ),
+        }
+    } else {
+        tracing::info!(
+            "historian worker disabled (release ck-mc is slice-1: transform/status only; set MC_HISTORIAN_ENABLED=1 to try)"
+        );
+    }
 
     let router = Router::new()
         .route("/health", get(health))

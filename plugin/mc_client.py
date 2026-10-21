@@ -231,11 +231,48 @@ class MCClient:
 
     # ---------- HTTP ----------
 
+    async def call(self, payload: dict) -> dict:
+        """通用转发：把任意 request body 交给 adapter → ck-mc。
+
+        用于 method 形式的运维接口（session.wrapup / session.status 等）。
+        facade 形式（ctx_* 工具）需要 thalamus 网关，本部署未安装，暂不可用。
+        """
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.post(
+                f"{self.base_url}/v1/transform", json=payload
+            ) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    raise RuntimeError(f"mc-adapter {resp.status}: {body[:400]}")
+                return json.loads(body)
+
+    async def wrapup(
+        self, session_id: str, historian_models: list[str] | None = None
+    ) -> dict:
+        """手动触发历史压缩（ck-mc 的 session.wrapup）。"""
+        payload: dict[str, Any] = {
+            "method": "session.wrapup",
+            "v": 1,
+            "session_id": session_id,
+        }
+        # 不带模型链时 ck-mc 会直接返回 no_models，压缩永远不会发生
+        if historian_models:
+            payload["historian_model_chain"] = historian_models
+        return await self.call(payload)
+
+    async def status(self, session_id: str) -> dict:
+        """查询该会话的 compartment / 覆盖情况。"""
+        return await self.call(
+            {"method": "session.status", "v": 1, "session_id": session_id}
+        )
+
     async def transform(
         self,
         session_id: str,
         messages: list[dict],
         render_config: str = "astrbot-v1",
+        historian_models: list[str] | None = None,
     ) -> list[dict]:
         payload = {
             "kind": "transform",
@@ -245,6 +282,9 @@ class MCClient:
             "render_config": render_config,
             "messages": self.to_ck_messages(session_id, messages),
         }
+        # historian 的模型链随请求携带；不传的话 session.wrapup 会返回 no_models
+        if historian_models:
+            payload["historian_model_chain"] = historian_models
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.post(f"{self.base_url}/v1/transform", json=payload) as resp:

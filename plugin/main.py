@@ -9,10 +9,13 @@ ck-mc 的 cache-stability transform，再把结果原样送给上游 provider。
 
 from __future__ import annotations
 
+import json
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from astrbot.api import logger
+from astrbot.api import FunctionTool, logger
+from astrbot.api.event import AstrMessageEvent
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.provider.register import register_provider_adapter
 from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
@@ -32,6 +35,76 @@ def _state_file() -> Path:
     except Exception:
         base = Path("data") / "plugin_data" / PLUGIN_NAME
     return base / "mc_ordinals.json"
+
+
+_SHARED_CLIENT: MCClient | None = None
+
+
+def _shared_client() -> MCClient:
+    """工具用的共享 client（与 provider 同一 adapter 地址）。"""
+    global _SHARED_CLIENT
+    if _SHARED_CLIENT is None:
+        _SHARED_CLIENT = MCClient(
+            base_url=os.environ.get("MC_ADAPTER_URL", DEFAULT_ADAPTER_URL),
+            state_path=_state_file(),
+        )
+    return _SHARED_CLIENT
+
+
+@dataclass
+class MCWrapupTool(FunctionTool):
+    """手动触发历史压缩。"""
+
+    name: str = "mc_wrapup"
+    description: str = (
+        "手动压缩较早的对话历史（Magic Context 的 session.wrapup）。"
+        "当用户说“整理一下前面聊的”“压缩一下记忆”“这段不用记了”时调用。"
+    )
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        }
+    )
+
+    async def run(self, event: AstrMessageEvent):
+        try:
+            res = await _shared_client().wrapup(event.unified_msg_origin)
+        except Exception as exc:  # 不阻断对话
+            return f"mc_wrapup failed: {exc}"
+        return json.dumps(res, ensure_ascii=False)[:1800]
+
+
+@dataclass
+class MCStatusTool(FunctionTool):
+    """查询压缩状态。"""
+
+    name: str = "mc_status"
+    description: str = "查看 Magic Context 当前会话的历史压缩状态（compartment 数量、覆盖率、是否已建立边界）。"
+    parameters: dict = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        }
+    )
+
+    async def run(self, event: AstrMessageEvent):
+        try:
+            res = await _shared_client().status(event.unified_msg_origin)
+        except Exception as exc:
+            return f"mc_status failed: {exc}"
+        keep = {
+            k: res.get(k)
+            for k in (
+                "compartment_count",
+                "compartment_tokens",
+                "boundary_present",
+                "coverage_ordinal",
+            )
+        }
+        return json.dumps(keep, ensure_ascii=False)
 
 
 @register_provider_adapter(
@@ -130,6 +203,12 @@ class MagicContextPlugin(Star):
     def __init__(self, context: Context) -> None:
         super().__init__(context)
         self._state_file = _state_file()
+        # 注册 Magic Context 的运维工具（facade 形式的 ctx_* 需要 thalamus 网关，
+        # 本部署没有，所以只暴露 method 形式可用的能力）
+        try:
+            self.context.add_llm_tools(MCWrapupTool(), MCStatusTool())
+        except Exception as exc:
+            logger.warning("[mc] 注册工具失败: %s", exc)
         logger.info(
             "[mc] 插件已加载；在 WebUI 新建 provider 时选择类型 mc_openai，"
             "adapter 默认 %s",

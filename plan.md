@@ -100,6 +100,26 @@ ck health               # magic-context
 
 ---
 
+### 3.1 发布版 ck-mc 实测可用接口
+
+`ck-mc-alpha.22464bf2` 实际只开放了 slice-1（cache-stability spine）。
+
+| 接口 | 形式 | 状态 | 备注 |
+|---|---|---|---|
+| `transform` | `{kind:"transform", v:2, ...}` | ✅ 可用 | 83 ms 返回 m[0]/m[1]+tail |
+| `health` / `session.status` | `{method:"...", v:1}` | ✅ 可用 | 返回 epochs / compartment 统计 |
+| `session.wrapup` | `{method:"session.wrapup", v:1}` | ⚠️ 可调用 | 但返回 `no_models`，见下 |
+| `agent_drops.append` | `{method:"agent_drops.append", command_id, drop:"3-5"}` | ✅ 可调用 | 需真实 tag 编号，否则 `no valid tags` |
+| `session.flush` | `{method:"session.flush", v:1}` | ✅ 可用 | 返回 armed |
+| `guidance.get` / `manifest.get` | `{method, v:1}` | ✅ 可用 | manifest 给出 5 个 ctx_* 工具 schema |
+| `historian.pending/claim/complete` | `{method:"historian.pending"}` | ❌ 未开放 | 返回 `unrecognized_request_shape` |
+| `ctx_reduce/memory/expand/search/note` | facade `{name, arguments}` | ❌ 不可用 | 需 `thalamus` 网关解析 session，返回 `session_resolve_timeout` |
+
+**historian 卡点**：`session.wrapup` 用的是「该 session 上一次 transform 携带的
+`historian_model_chain`」快照（`lib.rs:7009`），而不是 wrapup 请求自身的字段；
+且模型链格式/白名单尚未验证通过（当前带 `["deepseek-chat"]` 仍返回 `no_models`）。
+下一步应在插件配置界面暴露 historian 模型项，用 `provider/model` 形式注入并复测。
+
 ## 4. 接口与映射
 
 ### 4.1 adapter 对外接口（兼容层）
@@ -132,7 +152,7 @@ GET  /health
 | M1 | 进程内跑通 transform，输出 m[0]/m[1]/tail | ✅ |
 | M2 | Rust adapter HTTP + Python provider 插件 + 映射往返 | ✅ |
 | M3 | 切到 subc daemon 形态，adapter 作为 consumer 调 ck-mc | ✅ |
-| M4 | `ctx_reduce` / `ctx_expand` / `ctx_search` 工具注册 | ⬜ |
+| M4 | 注册运维工具（wrapup / status） | ✅ 部分 |
 | M5 | 自动更新流水线（备份 + 编译 + 原子切换） | ⬜ |
 
 ### M1 实测结果（进程内）
