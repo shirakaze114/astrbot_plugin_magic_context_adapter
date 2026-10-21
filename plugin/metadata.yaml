@@ -1,0 +1,6 @@
+name: astrbot_plugin_magic_context
+display_name: Magic Context
+desc: 把每次模型调用接入 Magic Context（ck-mc）的上下文管理：历史降档、可逆丢弃、缓存稳定。
+version: 0.1.0
+author: 柳烟
+repo: https://github.com/cortexkit/magic-context

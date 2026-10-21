@@ -1,0 +1,16 @@
+# 上游仓库（由 scripts/bootstrap.sh 拉取）
+magic-context/
+
+# Rust 构建产物
+adapter/target/
+adapter/Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行时数据（store.db / context.db / ordinal 映射）
+data/
+*.db
+*.db-wal
+*.db-shm

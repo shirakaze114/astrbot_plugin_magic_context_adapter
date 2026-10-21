@@ -1,0 +1,257 @@
+"""OpenAI messages <-> Magic Context CK wire 的映射与 HTTP 客户端。
+
+只做翻译，不做任何"丢什么/压什么"的决策——决策全部在 ck-mc 内部。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+
+SERIALIZER_PROFILE = "owned-llmrunner"
+
+
+class MCClient:
+    def __init__(self, base_url: str, state_path: Path, timeout: float = 30.0) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.state_path = state_path
+        self.timeout = timeout
+        self._state: dict[str, Any] = self._load()
+        self._lock = asyncio.Lock()
+
+    # ---------- ordinal / 身份持久化 ----------
+
+    def _load(self) -> dict[str, Any]:
+        try:
+            return json.loads(self.state_path.read_text("utf-8"))
+        except Exception:
+            return {}
+
+    def _save(self) -> None:
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._state, ensure_ascii=False), "utf-8")
+            os.replace(tmp, self.state_path)
+        except Exception:
+            pass
+
+    def _ordinal_for(self, session_id: str, fingerprint: str) -> int:
+        sess = self._state.setdefault(session_id, {"next": 1, "map": {}})
+        mapping: dict[str, int] = sess.setdefault("map", {})
+        if fingerprint in mapping:
+            return mapping[fingerprint]
+        n = int(sess.get("next", 1))
+        sess["next"] = n + 1
+        mapping[fingerprint] = n
+        # 控制状态体积：只保留最近 2000 条
+        if len(mapping) > 4000:
+            keep = sorted(mapping.items(), key=lambda kv: kv[1])[-2000:]
+            sess["map"] = dict(keep)
+        self._save()
+        return n
+
+    @staticmethod
+    def _fingerprint(role: str, content: Any, tool_calls: Any, tool_call_id: Any) -> str:
+        h = hashlib.sha256()
+        h.update(role.encode("utf-8"))
+        h.update(b"\x00")
+        if isinstance(content, str):
+            h.update(content.encode("utf-8"))
+        else:
+            h.update(json.dumps(content, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+        if tool_calls:
+            h.update(json.dumps(tool_calls, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+        if tool_call_id:
+            h.update(str(tool_call_id).encode("utf-8"))
+        return h.hexdigest()[:40]
+
+    # ---------- OpenAI -> CK ----------
+
+    @staticmethod
+    def _tool_output(raw: Any) -> dict[str, Any]:
+        """把 OpenAI 的 tool 结果转成 CkToolOutput。"""
+        if isinstance(raw, str):
+            return {"kind": {"type": "text", "text": raw}}
+        if raw is None:
+            return {"kind": {"type": "text", "text": ""}}
+        return {"kind": {"type": "json", "value": raw}}
+
+    def to_ck_messages(self, session_id: str, messages: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for idx, msg in enumerate(messages):
+            role = str(msg.get("role") or "user")
+            content = msg.get("content")
+            tool_calls = msg.get("tool_calls")
+            tool_call_id = msg.get("tool_call_id")
+
+            fp = self._fingerprint(role, content, tool_calls, tool_call_id)
+            ordinal = self._ordinal_for(session_id, fp)
+
+            blocks: list[dict] = []
+            if role == "tool":
+                blocks.append(
+                    {
+                        "kind": {
+                            "type": "tool_result",
+                            "id": str(tool_call_id or ""),
+                            "tool_name": str(msg.get("name") or "tool"),
+                            "output": self._tool_output(content),
+                        }
+                    }
+                )
+            else:
+                if isinstance(content, str):
+                    if content:
+                        blocks.append({"kind": {"type": "text", "text": content}})
+                elif isinstance(content, list):
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        ptype = part.get("type")
+                        if ptype == "text":
+                            blocks.append({"kind": {"type": "text", "text": part.get("text", "")}})
+                        elif ptype in ("image_url", "image"):
+                            blocks.append(
+                                {
+                                    "kind": {
+                                        "type": "opaque",
+                                        "opaque": {
+                                            "kind": str(ptype),
+                                            "data": json.dumps(part, ensure_ascii=False),
+                                        },
+                                    }
+                                }
+                            )
+                if tool_calls:
+                    for tc in tool_calls:
+                        fn = (tc or {}).get("function") or {}
+                        raw_args = fn.get("arguments")
+                        if isinstance(raw_args, str):
+                            try:
+                                parsed = json.loads(raw_args) if raw_args.strip() else {}
+                            except Exception:
+                                parsed = {"__raw": raw_args}
+                        else:
+                            parsed = raw_args if raw_args is not None else {}
+                        blocks.append(
+                            {
+                                "kind": {
+                                    "type": "tool_call",
+                                    "id": str((tc or {}).get("id") or ""),
+                                    "name": str(fn.get("name") or ""),
+                                    "input": parsed,
+                                }
+                            }
+                        )
+                if not blocks:
+                    blocks.append({"kind": {"type": "text", "text": ""}})
+
+            out.append(
+                {
+                    "mid": f"{idx}-{fp[:12]}",
+                    "ordinal": ordinal,
+                    "ck": {"role": role, "content": blocks},
+                }
+            )
+        return out
+
+    # ---------- CK -> OpenAI ----------
+
+    @staticmethod
+    def from_ck_messages(ck_messages: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for msg in ck_messages or []:
+            role = msg.get("role") or "user"
+            texts: list[str] = []
+            tool_calls: list[dict] = []
+            tool_name = None
+            tool_call_id = None
+            tool_output = None
+
+            for block in msg.get("content") or []:
+                kind = block.get("kind") or {}
+                btype = kind.get("type")
+                if btype == "text":
+                    texts.append(kind.get("text") or "")
+                elif btype == "reasoning":
+                    continue
+                elif btype == "tool_call":
+                    tool_calls.append(
+                        {
+                            "id": kind.get("id") or "",
+                            "type": "function",
+                            "function": {
+                                "name": kind.get("name") or "",
+                                "arguments": json.dumps(
+                                    kind.get("input") or {}, ensure_ascii=False
+                                ),
+                            },
+                        }
+                    )
+                elif btype == "tool_result":
+                    tool_call_id = kind.get("id") or ""
+                    tool_name = kind.get("tool_name") or "tool"
+                    out_kind = (kind.get("output") or {}).get("kind") or {}
+                    if out_kind.get("type") in ("text", "error_text"):
+                        tool_output = out_kind.get("text") or ""
+                    elif out_kind.get("type") in ("json", "error_json"):
+                        tool_output = json.dumps(out_kind.get("value"), ensure_ascii=False)
+                    else:
+                        tool_output = json.dumps(out_kind, ensure_ascii=False)
+
+            if role == "tool":
+                out.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id or "",
+                        "name": tool_name or "tool",
+                        "content": tool_output or "",
+                    }
+                )
+                continue
+
+            entry: dict[str, Any] = {"role": role, "content": "\n".join(t for t in texts if t)}
+            if tool_calls:
+                entry["tool_calls"] = tool_calls
+            out.append(entry)
+
+        # OpenAI 兼容端点要求 system 在首位，而 mc 会把 m[0]/m[1] 插到最前面；
+        # 这里把 system 消息提回顶部（保持相互顺序），避免上游把 system 当普通消息。
+        systems = [m for m in out if m.get("role") == "system"]
+        if systems:
+            out = systems + [m for m in out if m.get("role") != "system"]
+        return out
+
+    # ---------- HTTP ----------
+
+    async def transform(
+        self,
+        session_id: str,
+        messages: list[dict],
+        render_config: str = "astrbot-v1",
+    ) -> list[dict]:
+        payload = {
+            "kind": "transform",
+            "v": 2,
+            "serializer_profile": SERIALIZER_PROFILE,
+            "session_id": session_id,
+            "render_config": render_config,
+            "messages": self.to_ck_messages(session_id, messages),
+        }
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.post(f"{self.base_url}/v1/transform", json=payload) as resp:
+                body = await resp.text()
+                if resp.status != 200:
+                    raise RuntimeError(f"mc-adapter {resp.status}: {body[:400]}")
+                data = json.loads(body)
+        if data.get("status") != "ok":
+            raise RuntimeError(f"mc transform error: {data}")
+        return self.from_ck_messages(data.get("ck_messages") or [])
