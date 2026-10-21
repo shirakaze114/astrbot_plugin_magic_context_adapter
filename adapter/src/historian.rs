@@ -94,7 +94,7 @@ async fn tick(
     let pending = call_module(
         consumer,
         project_root,
-        json!({ "method": "historian.pending" }),
+        json!({ "method": "historian.pending", "v": 1 }),
     )
     .await?;
 
@@ -120,6 +120,7 @@ async fn tick(
             project_root,
             json!({
                 "method": "historian.claim",
+                "v": 1,
                 "run_id": run_id,
                 "claimant_instance_id": CLAIMANT,
             }),
@@ -158,6 +159,7 @@ async fn tick(
                     project_root,
                     json!({
                         "method": "historian.complete",
+                        "v": 1,
                         "run_id": run_id,
                         "token": token,
                         "error": { "message": e },
@@ -174,6 +176,7 @@ async fn tick(
             project_root,
             json!({
                 "method": "historian.complete",
+                "v": 1,
                 "run_id": run_id,
                 "token": token,
                 "output": { "text": output },

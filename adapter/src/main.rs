@@ -33,6 +33,7 @@ const HARNESS: &str = "astrbot";
 struct App {
     consumer: Arc<SubcConsumer>,
     project_root: PathBuf,
+    call_timeout: std::time::Duration,
     started_at_ms: u128,
 }
 
@@ -87,9 +88,14 @@ async fn do_transform(
         )
     })?;
 
+    let opts = CallOptions {
+        timeout: app.call_timeout,
+        ..Default::default()
+    };
+
     match app
         .consumer
-        .call(target, identity, payload, CallOptions::default())
+        .call(target, identity, payload, opts)
         .await
     {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
@@ -141,6 +147,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Arc::new(App {
         consumer: Arc::new(consumer),
         project_root: project_root.clone(),
+        call_timeout: std::time::Duration::from_secs(
+            std::env::var("MC_CALL_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+        ),
         started_at_ms: now_ms(),
     });
 
