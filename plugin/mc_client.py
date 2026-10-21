@@ -24,6 +24,9 @@ class MCClient:
         self.timeout = timeout
         self._state: dict[str, Any] = self._load()
         self._lock = asyncio.Lock()
+        # ordinal 分配 + HTTP 往返整体串行，避免并发交错导致 mc 拒绝乱序
+        self._transform_lock = asyncio.Lock()
+        self.last_rebase: tuple[str, int, int] | None = None
 
     # ---------- ordinal / 身份持久化 ----------
 
@@ -201,15 +204,18 @@ class MCClient:
             )
 
         # 单调性保护：mc 要求 live ordinals 严格递增。
-        # 历史窗口滑动、旧消息复现等情况会让指纹序号乱序，这里整体重排到
-        # “当前最大值之后”的安全区间，并同步更新持久化映射。
-        if any(
-            out[i]["ordinal"] >= out[i + 1]["ordinal"] for i in range(len(out) - 1)
-        ):
-            base = max((m["ordinal"] for m in out), default=0) + 1
-            for i, msg in enumerate(out):
-                msg["ordinal"] = base + i
-                self._set_ordinal(session_id, keys[i], base + i)
+        # 出现乱序（窗口滑动、旧消息复现、并发请求共用映射）时，
+        # 整段重排到一个安全区间，并同步持久化。
+        if len(out) > 1:
+            bad = any(
+                out[i]["ordinal"] >= out[i + 1]["ordinal"] for i in range(len(out) - 1)
+            )
+            if bad:
+                base = max((m["ordinal"] for m in out), default=0) + 1
+                for i, msg in enumerate(out):
+                    msg["ordinal"] = base + i
+                    self._set_ordinal(session_id, keys[i], base + i)
+                self.last_rebase = (session_id, base, len(out))
         return out
 
     # ---------- CK -> OpenAI ----------
@@ -344,6 +350,20 @@ class MCClient:
         )
 
     async def transform(
+        self,
+        session_id: str,
+        messages: list[dict],
+        render_config: str = "astrbot-v1",
+        historian_models: list[str] | None = None,
+    ) -> list[dict]:
+        # 串行化：ordinal 分配与持久化不是线程/协程安全的，
+        # 并发（工具循环 + 多平台）交错会导致序列乱序被 mc 拒绝。
+        async with self._transform_lock:
+            return await self._transform_locked(
+                session_id, messages, render_config, historian_models
+            )
+
+    async def _transform_locked(
         self,
         session_id: str,
         messages: list[dict],

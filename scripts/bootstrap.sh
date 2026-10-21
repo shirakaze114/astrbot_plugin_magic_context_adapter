@@ -68,6 +68,9 @@ Wants=network-online.target ck-subc.service
 Type=simple
 WorkingDirectory=${ROOT}
 Environment=HOME=/root
+# 与 ck-subc 一致：让 subc client 在 /run/user/0 找到 connection file，
+# 否则会退到 /tmp 读到过期文件，鉴权失败（InvalidServerProof）
+Environment=XDG_RUNTIME_DIR=/run/user/0
 Environment=MC_ADAPTER_PORT=${ADAPTER_PORT}
 Environment=MC_PROJECT_ROOT=${PROJECT_ROOT}
 Environment=MC_HISTORIAN_ENABLED=1
@@ -96,6 +99,10 @@ Wants=network-online.target
 Type=simple
 Environment=HOME=/root
 Environment=XDG_CONFIG_HOME=/root/.config
+# 固定 run 目录，保证 connection file 落在 /run/user/0，
+# 否则 daemon 会退到 /tmp，与旧的 orphant 文件并存导致 ck 鉴权失败
+Environment=XDG_RUNTIME_DIR=/run/user/0
+RuntimeDirectory=subc
 ExecStart=${CK_SUBC}
 Restart=always
 RestartSec=5

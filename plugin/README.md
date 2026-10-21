@@ -31,9 +31,23 @@ curl -s 127.0.0.1:8317/health
 cp -r plugin /path/to/AstrBot/data/plugins/astrbot_plugin_magic_context
 ```
 
-重载插件后生效。**不需要新建 provider**：插件会 patch 所有 OpenAI 兼容 provider
+重载插件后**直接生效，不需要新建 provider**：插件会 patch 所有 OpenAI 兼容 provider
 （`ProviderOpenAIOfficial` 及其子类）的 `text_chat` / `text_chat_stream`，
-现有模型直接走 mc。
+你当前会话用的模型（例如 `workbudget/deepseek-v4.1-flash`）会自动走 mc，
+无需在 WebUI 里改任何模型配置。
+
+> 只有当你想**单独指定**某个模型走 mc（而不是全局）时，才需要在 WebUI 新建
+> `type=mc_openai` 的 provider，字段如下：
+>
+> | 字段 | 值 |
+> |---|---|
+> | 类型 | `mc_openai` |
+> | api_base | 上游真实地址，如 `https://api.deepseek.com/v1` |
+> | key | 上游 key |
+> | model | 上游模型名 |
+> | mc_adapter_url | `http://127.0.0.1:8317` |
+>
+> 这是可选路径，默认用不上。
 
 ## 指令
 
