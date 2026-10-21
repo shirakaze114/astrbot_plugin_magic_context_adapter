@@ -85,6 +85,7 @@ class MCClient:
 
     def to_ck_messages(self, session_id: str, messages: list[dict]) -> list[dict]:
         out: list[dict] = []
+        seen: dict[str, int] = {}
         for idx, msg in enumerate(messages):
             role = str(msg.get("role") or "user")
             content = msg.get("content")
@@ -92,7 +93,11 @@ class MCClient:
             tool_call_id = msg.get("tool_call_id")
 
             fp = self._fingerprint(role, content, tool_calls, tool_call_id)
-            ordinal = self._ordinal_for(session_id, fp)
+            # 同内容可能出现多次（例如两轮都是"你好"），加出现序号保证唯一，
+            # 否则会分到同一个 ordinal，mc 会拒绝（要求严格递增）
+            occ = seen.get(fp, 0)
+            seen[fp] = occ + 1
+            ordinal = self._ordinal_for(session_id, f"{fp}#{occ}")
 
             blocks: list[dict] = []
             if role == "tool":
@@ -118,14 +123,37 @@ class MCClient:
                         if ptype == "text":
                             blocks.append({"kind": {"type": "text", "text": part.get("text", "")}})
                         elif ptype in ("image_url", "image"):
+                            # CkKind::Media 需要 kind/media_type/source。
+                            # 图片按 media 透传，回填时再还原成 image_url，
+                            # 这样 mc 统计 token 时看得见，模型也仍然能看图。
+                            iu = part.get("image_url")
+                            url = ""
+                            if isinstance(iu, dict):
+                                url = str(iu.get("url") or "")
+                            elif isinstance(iu, str):
+                                url = iu
+                            if not url:
+                                url = str(part.get("url") or "")
+
+                            media_type = "image/jpeg"
+                            source: dict[str, Any]
+                            if url.startswith("data:"):
+                                head, _, payload = url.partition(",")
+                                media_type = head[5:].split(";")[0] or media_type
+                                source = {"type": "data_base64", "data": payload}
+                            elif url:
+                                source = {"type": "url", "url": url}
+                            else:
+                                source = {"type": "opaque", "raw": part}
+
                             blocks.append(
                                 {
                                     "kind": {
-                                        "type": "opaque",
-                                        "opaque": {
-                                            "kind": str(ptype),
-                                            "data": json.dumps(part, ensure_ascii=False),
-                                        },
+                                        # 内部标签枚举：MediaBlock 的字段与 tag 平铺
+                                        "type": "media",
+                                        "kind": "image",
+                                        "media_type": media_type,
+                                        "source": source,
                                     }
                                 }
                             )
@@ -175,6 +203,7 @@ class MCClient:
             tool_call_id = None
             tool_output = None
 
+            media_parts: list[dict] = []
             for block in msg.get("content") or []:
                 kind = block.get("kind") or {}
                 btype = kind.get("type")
@@ -182,6 +211,22 @@ class MCClient:
                     texts.append(kind.get("text") or "")
                 elif btype == "reasoning":
                     continue
+                elif btype == "media":
+                    # CkKind 是内部标签枚举：MediaBlock 的字段与 `type` 平铺在同一层
+                    media = kind
+                    src = media.get("source") or {}
+                    stype = src.get("type")
+                    if stype == "url":
+                        url = str(src.get("url") or "")
+                    elif stype == "data_base64":
+                        mime = str(media.get("media_type") or "image/jpeg")
+                        url = f"data:{mime};base64,{src.get('data') or ''}"
+                    else:
+                        continue
+                    if url:
+                        media_parts.append(
+                            {"type": "image_url", "image_url": {"url": url}}
+                        )
                 elif btype == "tool_call":
                     tool_calls.append(
                         {
@@ -217,7 +262,16 @@ class MCClient:
                 )
                 continue
 
-            entry: dict[str, Any] = {"role": role, "content": "\n".join(t for t in texts if t)}
+            joined = "\n".join(t for t in texts if t)
+            if media_parts:
+                content: Any = []
+                if joined:
+                    content.append({"type": "text", "text": joined})
+                content.extend(media_parts)
+            else:
+                content = joined
+
+            entry: dict[str, Any] = {"role": role, "content": content}
             if tool_calls:
                 entry["tool_calls"] = tool_calls
             out.append(entry)

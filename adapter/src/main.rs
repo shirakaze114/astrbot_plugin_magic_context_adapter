@@ -13,7 +13,7 @@ use std::{
 };
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -75,6 +75,13 @@ async fn do_transform(
         .and_then(|v| v.as_str())
         .unwrap_or("astrbot-default")
         .to_string();
+
+    let n_msgs = raw
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    tracing::info!("transform session={session} messages={n_msgs}");
 
     let identity = BindIdentity::new(app.project_root.clone(), HARNESS, session.clone());
     let target = RouteTarget::ToolProvider {
@@ -188,6 +195,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router = Router::new()
         .route("/health", get(health))
         .route("/v1/transform", post(do_transform))
+        // 长会话的 transform 请求体可以很大（上千条消息），放宽到 64 MiB
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(app);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
