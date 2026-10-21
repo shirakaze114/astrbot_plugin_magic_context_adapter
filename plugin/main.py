@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,6 +48,11 @@ _PATCH_INSTALLED = False
 # AstrBot 的 conversation_id 与 UMO 的映射：patch 只能拿到前者，
 # 但对话隔离要以 UMO 为准（/reset 后 conversation_id 会变，UMO 不变）。
 _CONV_TO_UMO: dict[str, str] = {}
+# 熔断：连续失败到阈值就暂停 transform 一段时间，保证永远不拖住正常对话
+_MC_FAILS = 0
+_MC_OFF_UNTIL = 0.0
+_MC_FAIL_THRESHOLD = 3
+_MC_COOLDOWN_SECONDS = 120.0
 
 
 def _shared_client() -> MCClient:
@@ -79,8 +85,30 @@ def _trace_patch_call(owner, kwargs: dict) -> None:
         pass
 
 
+def _reset_failures() -> None:
+    global _MC_FAILS
+    _MC_FAILS = 0
+
+
+def _note_failure(exc: Exception) -> None:
+    """记一次失败；连续失败到阈值就熔断一段时间，避免拖住正常对话。"""
+    global _MC_FAILS, _MC_OFF_UNTIL
+    _MC_FAILS += 1
+    if _MC_FAILS >= _MC_FAIL_THRESHOLD:
+        _MC_OFF_UNTIL = time.time() + _MC_COOLDOWN_SECONDS
+        logger.warning(
+            "[mc] 连续失败 %d 次，暂停 transform %.0fs（对话不受影响）: %s",
+            _MC_FAILS,
+            _MC_COOLDOWN_SECONDS,
+            exc,
+        )
+        _MC_FAILS = 0
+
+
 async def _mc_wrap_payload(owner, kwargs: dict) -> dict:
     """把一次 model call 的 contexts 交给 mc 过一遍，失败则原样返回。"""
+    if time.time() < _MC_OFF_UNTIL:
+        return kwargs
     _trace_patch_call(owner, kwargs)
     if getattr(owner, "_mc_patch_disabled", False):
         return kwargs
@@ -113,8 +141,12 @@ async def _mc_wrap_payload(owner, kwargs: dict) -> dict:
             merged = False
 
     try:
-        transformed = await _shared_client().transform(session_id, raw)
+        transformed = await asyncio.wait_for(
+            _shared_client().transform(session_id, raw), timeout=8
+        )
+        _reset_failures()
     except Exception as exc:
+        _note_failure(exc)
         _trace_patch_call(owner, {"contexts": raw, "session_id": f"ERROR {session_id}: {exc}"})
         logger.warning("[mc] transform 失败，回退原始上下文: %s", exc)
         return kwargs

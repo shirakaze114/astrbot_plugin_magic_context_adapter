@@ -57,6 +57,14 @@ class MCClient:
         self._save()
         return n
 
+    def _set_ordinal(self, session_id: str, fingerprint: str, ordinal: int) -> None:
+        """重排后同步更新持久化映射（保持跨轮稳定）。"""
+        sess = self._state.setdefault(session_id, {"next": 1, "map": {}})
+        mapping: dict[str, int] = sess.setdefault("map", {})
+        mapping[fingerprint] = ordinal
+        sess["next"] = max(int(sess.get("next", 1)), ordinal + 1)
+        self._save()
+
     @staticmethod
     def _fingerprint(role: str, content: Any, tool_calls: Any, tool_call_id: Any) -> str:
         h = hashlib.sha256()
@@ -85,6 +93,7 @@ class MCClient:
 
     def to_ck_messages(self, session_id: str, messages: list[dict]) -> list[dict]:
         out: list[dict] = []
+        keys: list[str] = []
         seen: dict[str, int] = {}
         for idx, msg in enumerate(messages):
             role = str(msg.get("role") or "user")
@@ -97,7 +106,9 @@ class MCClient:
             # 否则会分到同一个 ordinal，mc 会拒绝（要求严格递增）
             occ = seen.get(fp, 0)
             seen[fp] = occ + 1
-            ordinal = self._ordinal_for(session_id, f"{fp}#{occ}")
+            key = f"{fp}#{occ}"
+            ordinal = self._ordinal_for(session_id, key)
+            keys.append(key)
 
             blocks: list[dict] = []
             if role == "tool":
@@ -188,6 +199,17 @@ class MCClient:
                     "ck": {"role": role, "content": blocks},
                 }
             )
+
+        # 单调性保护：mc 要求 live ordinals 严格递增。
+        # 历史窗口滑动、旧消息复现等情况会让指纹序号乱序，这里整体重排到
+        # “当前最大值之后”的安全区间，并同步更新持久化映射。
+        if any(
+            out[i]["ordinal"] >= out[i + 1]["ordinal"] for i in range(len(out) - 1)
+        ):
+            base = max((m["ordinal"] for m in out), default=0) + 1
+            for i, msg in enumerate(out):
+                msg["ordinal"] = base + i
+                self._set_ordinal(session_id, keys[i], base + i)
         return out
 
     # ---------- CK -> OpenAI ----------
