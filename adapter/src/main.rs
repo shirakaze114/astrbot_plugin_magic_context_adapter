@@ -167,14 +167,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 发布版 ck-mc-alpha.22464bf2 尚未开放 historian.pending/claim/complete
     // （实测返回 unrecognized_request_shape），开启只会空转刷错误日志。
     // 上游开放后设置 MC_HISTORIAN_ENABLED=1 + MC_LLM_* 即可启用。
+    // historian 渠道的唯一来源是插件面板写入的 llm.json。
+    // 环境变量只是显式覆盖（可选），不再作为默认兜底：
+    // 面板选了 A 渠道、后台绝不允许偷偷改用 B 渠道。
     let historian_enabled = std::env::var("MC_HISTORIAN_ENABLED")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     if historian_enabled {
-        match historian::llm_config_from_env() {
+        let from_file = historian::load_from_file();
+        let from_env = historian::llm_config_from_env();
+        match from_env.clone().or_else(|| from_file.clone()) {
             Some(llm) => {
-                tracing::info!("historian worker enabled (model={}, every 20s)", llm.model);
+                let src = if from_env.is_some() { "env" } else { "llm.json" };
+                tracing::info!(
+                    "historian worker enabled (source={src}, model={}, every 20s)",
+                    llm.model
+                );
                 historian::spawn(
                     app.consumer.clone(),
                     project_root.clone(),
@@ -183,13 +192,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             None => tracing::warn!(
-                "MC_HISTORIAN_ENABLED set but MC_LLM_BASE_URL / MC_LLM_MODEL missing"
+                "historian worker 未启动：llm.json 缺 historian 渠道，且没有 MC_LLM_* 覆盖。\
+                 请在 AstrBot 插件面板选择 historian 模型。"
             ),
         }
     } else {
-        tracing::info!(
-            "historian worker disabled (release ck-mc is slice-1: transform/status only; set MC_HISTORIAN_ENABLED=1 to try)"
-        );
+        tracing::info!("historian worker disabled via MC_HISTORIAN_ENABLED=0");
     }
 
     let router = Router::new()

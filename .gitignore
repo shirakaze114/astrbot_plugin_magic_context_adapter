@@ -14,3 +14,6 @@ data/
 *.db
 *.db-wal
 *.db-shm
+
+# 运行脚本的临时备份
+scripts/*.bak.*
