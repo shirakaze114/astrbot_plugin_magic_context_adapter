@@ -1,0 +1,47 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用 Magic Context",
+    "default": true,
+    "hint": "关闭后所有 provider 恢复原生行为，不再经过 ck-mc。"
+  },
+  "historian_provider_id": {
+    "type": "string",
+    "description": "① 历史压缩模型（historian）",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "把旧对话压成分档摘要。建议用便宜快的模型；留空则跟随当前会话模型。"
+  },
+  "dreamer_provider_id": {
+    "type": "string",
+    "description": "② 夜间维护模型（dreamer）",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "验证记忆、去重、归档低价值条目。留空则沿用 historian 的模型。"
+  },
+  "embedding_provider_id": {
+    "type": "string",
+    "description": "③ 向量模型（embedding）",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "为摘要和记忆生成向量，供语义检索使用。需选 embedding 类型的 provider。"
+  },
+  "mc_adapter_url": {
+    "type": "string",
+    "description": "mc-adapter 地址",
+    "default": "http://127.0.0.1:8317",
+    "hint": "本地 Rust 适配层地址，通常保持默认。"
+  },
+  "mc_timeout": {
+    "type": "int",
+    "description": "transform 超时（秒）",
+    "default": 8,
+    "hint": "超过该时间即回退原始上下文，避免拖慢对话。"
+  },
+  "mc_circuit_threshold": {
+    "type": "int",
+    "description": "熔断阈值（连续失败次数）",
+    "default": 3,
+    "hint": "连续失败达到该次数后，暂停 transform 120 秒。"
+  }
+}

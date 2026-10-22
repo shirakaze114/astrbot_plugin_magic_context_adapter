@@ -16,6 +16,15 @@ import aiohttp
 
 SERIALIZER_PROFILE = "owned-llmrunner"
 
+# historian 的模型链必须由 host 随请求携带，否则 mc 会拒绝开跑压缩
+# （日志里表现为 "the transform request carried no historian_model_chain"）。
+# 默认给一条，可用 MC_HISTORIAN_MODEL 覆盖；设为空字符串可禁用。
+DEFAULT_HISTORIAN_CHAIN = [
+    m.strip()
+    for m in os.environ.get("MC_HISTORIAN_MODEL", "deepseek/deepseek-chat").split(",")
+    if m.strip()
+]
+
 
 class MCClient:
     def __init__(self, base_url: str, state_path: Path, timeout: float = 30.0) -> None:
@@ -94,6 +103,37 @@ class MCClient:
             return {"kind": {"type": "text", "text": ""}}
         return {"kind": {"type": "json", "value": raw}}
 
+    def _assign_ordinals(self, session_id: str, keys: list[str]) -> list[int]:
+        """稳定偏移 + 位置分配 ordinal。
+
+        只允许往前推，绝不回头改写：mc 用「消息 id + ordinal」记 compartment 锚点，
+        一旦改写历史号就会报 `compartment boundary ordinal mismatch`。
+
+        - 新消息追加在尾部：偏移不变，序号自然续上；
+        - 历史从头部滑出窗口：偏移按滑出条数前进；
+        - 完全对不上（换会话/重置）：偏移前进到新段之后。
+        """
+        st = self._state.setdefault(session_id, {})
+        old: list[str] = list(st.get("keys") or [])
+        off = int(st.get("offset") or 0)
+
+        if old and keys:
+            max_k = min(len(old), len(keys))
+            overlap = 0
+            for k in range(max_k, 0, -1):
+                if old[-k:] == keys[:k]:
+                    overlap = k
+                    break
+            if overlap:
+                off += len(old) - overlap
+            else:
+                off += len(old)
+
+        st["keys"] = keys
+        st["offset"] = off
+        self._save()
+        return [off + i + 1 for i in range(len(keys))]
+
     def to_ck_messages(self, session_id: str, messages: list[dict]) -> list[dict]:
         out: list[dict] = []
         keys: list[str] = []
@@ -110,8 +150,8 @@ class MCClient:
             occ = seen.get(fp, 0)
             seen[fp] = occ + 1
             key = f"{fp}#{occ}"
-            ordinal = self._ordinal_for(session_id, key)
             keys.append(key)
+            ordinal = 0  # 先占位，循环结束后按「稳定偏移 + 位置」统一分配
 
             blocks: list[dict] = []
             if role == "tool":
@@ -206,16 +246,19 @@ class MCClient:
         # 单调性保护：mc 要求 live ordinals 严格递增。
         # 出现乱序（窗口滑动、旧消息复现、并发请求共用映射）时，
         # 整段重排到一个安全区间，并同步持久化。
-        if len(out) > 1:
-            bad = any(
-                out[i]["ordinal"] >= out[i + 1]["ordinal"] for i in range(len(out) - 1)
-            )
-            if bad:
-                base = max((m["ordinal"] for m in out), default=0) + 1
-                for i, msg in enumerate(out):
-                    msg["ordinal"] = base + i
-                    self._set_ordinal(session_id, keys[i], base + i)
-                self.last_rebase = (session_id, base, len(out))
+        # 按「稳定偏移 + 位置」分配 ordinal：新消息追加在尾部时序号自然续上，
+        # 历史从头部滑出时整体偏移前进，都不改写已分配的号。
+        for i, ordinal in enumerate(self._assign_ordinals(session_id, keys)):
+            out[i]["ordinal"] = ordinal
+
+        # 严格递增校验：ordinal 一旦分配就不能再改（mc 用「消息 id + ordinal」
+        # 作为 compartment 锚点，改写会让已存锚点对不上，报
+        # "compartment boundary ordinal mismatch"）。这里只检测不改写：
+        # 不满足时返回空列表，让调用方回退到原始上下文。
+        if any(out[i]["ordinal"] >= out[i + 1]["ordinal"] for i in range(len(out) - 1)):
+            logger = __import__("logging").getLogger("mc")
+            logger.warning("[mc] ordinal 序列不是严格递增，跳过本次 transform")
+            return []
         return out
 
     # ---------- CK -> OpenAI ----------
@@ -339,8 +382,10 @@ class MCClient:
             "session_id": session_id,
         }
         # 不带模型链时 ck-mc 会直接返回 no_models，压缩永远不会发生
-        if historian_models:
-            payload["historian_model_chain"] = historian_models
+        # historian 模型链：请求必须携带，否则 mc 不会触发历史压缩
+        chain = historian_models if historian_models is not None else DEFAULT_HISTORIAN_CHAIN
+        if chain:
+            payload["historian_model_chain"] = chain
         return await self.call(payload)
 
     async def status(self, session_id: str) -> dict:
@@ -348,6 +393,21 @@ class MCClient:
         return await self.call(
             {"method": "session.status", "v": 1, "session_id": session_id}
         )
+
+    def reset_session(self, session_id: str) -> None:
+        """清掉本地的 ordinal 状态（配合 mc 侧的 session.delete 使用）。"""
+        self._state.pop(session_id, None)
+        self._save()
+
+    async def reset_mc_session(self, session_id: str) -> None:
+        """让 mc 丢弃该会话的 compartments / 状态，用于锚点错乱后的自愈。"""
+        try:
+            await self.call(
+                {"method": "session.delete", "v": 1, "session_id": session_id}
+            )
+        except Exception:
+            pass
+        self.reset_session(session_id)
 
     async def transform(
         self,
@@ -378,9 +438,10 @@ class MCClient:
             "render_config": render_config,
             "messages": self.to_ck_messages(session_id, messages),
         }
-        # historian 的模型链随请求携带；不传的话 session.wrapup 会返回 no_models
-        if historian_models:
-            payload["historian_model_chain"] = historian_models
+        # historian 的模型链随请求携带；缺了 mc 不会触发历史压缩
+        chain = historian_models if historian_models is not None else DEFAULT_HISTORIAN_CHAIN
+        if chain:
+            payload["historian_model_chain"] = chain
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.post(f"{self.base_url}/v1/transform", json=payload) as resp:

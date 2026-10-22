@@ -22,6 +22,36 @@ pub struct LlmConfig {
     pub timeout_secs: u64,
 }
 
+/// 从插件写下的 llm.json 读取三个角色的模型配置。
+/// 文件不存在或解析失败时返回 None，调用方回退到环境变量。
+pub fn load_from_file() -> Option<LlmConfig> {
+    let path = std::env::var("MC_LLM_CONFIG")
+        .unwrap_or_else(|_| "/root/data/mc-adapter/data/llm.json".to_string());
+    let text = std::fs::read_to_string(&path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let role = v.get("historian").or_else(|| v.get("dreamer"))?;
+    let base_url = role.get("base_url").and_then(|x| x.as_str())?.to_string();
+    let model = role.get("model").and_then(|x| x.as_str())?.to_string();
+    if base_url.is_empty() || model.is_empty() {
+        return None;
+    }
+    let api_key = role
+        .get("api_key")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let timeout_secs = std::env::var("MC_LLM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    Some(LlmConfig {
+        base_url,
+        api_key,
+        model,
+        timeout_secs,
+    })
+}
+
 pub fn llm_config_from_env() -> Option<LlmConfig> {
     let base_url = std::env::var("MC_LLM_BASE_URL").ok()?;
     let api_key = std::env::var("MC_LLM_API_KEY").unwrap_or_default();
@@ -59,7 +89,9 @@ pub fn spawn(
         };
 
         loop {
-            if let Err(e) = tick(&consumer, &project_root, &llm, &client).await {
+            // 每轮重新读插件写下的配置：在 AstrBot 面板里换模型无需重启服务
+            let current = load_from_file().unwrap_or_else(|| llm.clone());
+            if let Err(e) = tick(&consumer, &project_root, &current, &client).await {
                 tracing::warn!("historian tick failed: {e}");
             }
             tokio::time::sleep(interval).await;

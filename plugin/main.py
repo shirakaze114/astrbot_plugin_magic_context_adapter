@@ -54,6 +54,47 @@ _MC_OFF_UNTIL = 0.0
 _MC_FAIL_THRESHOLD = 3
 _MC_COOLDOWN_SECONDS = 120.0
 
+# 插件配置面板（_conf_schema.json）的运行时快照
+_CFG: dict[str, Any] = {
+    "enabled": True,
+    "adapter_url": DEFAULT_ADAPTER_URL,
+    "historian_model": "",
+}
+
+# historian 的凭据落盘位置：adapter 每次 tick 会重新读取（改配置无需重启服务）
+_LLM_CONFIG_PATH = Path(
+    os.environ.get("MC_LLM_CONFIG", "/root/data/mc-adapter/data/llm.json")
+)
+
+
+def _write_llm_config(chain: dict) -> None:
+    """把三个角色（historian / dreamer / embedding）的模型写盘，交给 adapter。
+
+    结构：
+        {"historian": {base_url, api_key, model},
+         "dreamer":   {...},
+         "embedding": {...}}
+
+    adapter 每次 historian tick 会重新读这个文件，改配置无需重启服务。
+    """
+    try:
+        _LLM_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        roles: dict[str, dict] = {}
+        for role, cfg in (chain or {}).items():
+            if not isinstance(cfg, dict):
+                continue
+            roles[role] = {
+                "base_url": cfg.get("base_url", ""),
+                "api_key": cfg.get("api_key", ""),
+                "model": cfg.get("model", ""),
+            }
+        tmp = _LLM_CONFIG_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(roles, ensure_ascii=False), "utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _LLM_CONFIG_PATH)
+    except Exception as exc:
+        logger.warning("[mc] 写入模型配置失败: %s", exc)
+
 
 def _shared_client() -> MCClient:
     """工具与 patch 共用的 client（与 provider 同一 adapter 地址）。"""
@@ -148,7 +189,17 @@ async def _mc_wrap_payload(owner, kwargs: dict) -> dict:
     except Exception as exc:
         _note_failure(exc)
         _trace_patch_call(owner, {"contexts": raw, "session_id": f"ERROR {session_id}: {exc}"})
-        logger.warning("[mc] transform 失败，回退原始上下文: %s", exc)
+        text = str(exc)
+        # 锚点错乱自愈：mc 里存的 compartment 边界与本地 ordinal 对不上时，
+        # 丢掉该会话的 mc 状态与本地映射，下一轮从干净状态重建。
+        if "boundary ordinal mismatch" in text or "ordinals not strictly increasing" in text:
+            try:
+                await _shared_client().reset_mc_session(session_id)
+                logger.warning("[mc] 会话 %s 锚点错乱，已重置状态自愈", session_id)
+            except Exception as reset_exc:
+                logger.warning("[mc] 重置会话失败: %s", reset_exc)
+        else:
+            logger.warning("[mc] transform 失败，回退原始上下文: %s", exc)
         return kwargs
     if not transformed:
         return kwargs
@@ -399,9 +450,12 @@ def _register_provider_type() -> None:
 
 @register(PLUGIN_NAME, "柳烟", "Magic Context 上下文管理（provider 层）", "0.1.0", "")
 class MagicContextPlugin(Star):
-    def __init__(self, context: Context) -> None:
-        super().__init__(context)
+    def __init__(self, context: Context, config: dict | None = None) -> None:
+        super().__init__(context, config=config)
+        self.config = config or {}
         self._state_file = _state_file()
+        # 从插件配置面板读取（_conf_schema.json）
+        self._apply_plugin_config()
         # 覆盖现有 provider：不需要在 WebUI 新建类型，所有 OpenAI 兼容 provider 直接生效
         install_provider_patch()
         # 同时注册可选的新类型（幂等，避免重载时撞“已注册”保护）
@@ -413,10 +467,81 @@ class MagicContextPlugin(Star):
         except Exception as exc:
             logger.warning("[mc] 注册工具失败: %s", exc)
         logger.info(
-            "[mc] 插件已加载；在 WebUI 新建 provider 时选择类型 mc_openai，"
-            "adapter 默认 %s",
-            os.environ.get("MC_ADAPTER_URL", DEFAULT_ADAPTER_URL),
+            "[mc] 插件已加载；enabled=%s historian_model=%s adapter=%s",
+            _CFG.get("enabled"),
+            _CFG.get("historian_model") or "(跟随会话)",
+            _CFG.get("adapter_url"),
         )
+
+    def _apply_plugin_config(self) -> None:
+        """读取 _conf_schema.json 的配置面板值，并同步给 adapter。"""
+        global _SHARED_CLIENT
+        cfg = self.config or {}
+        _CFG["enabled"] = bool(cfg.get("enabled", True))
+        url = str(cfg.get("mc_adapter_url") or DEFAULT_ADAPTER_URL)
+        _CFG["adapter_url"] = url
+        timeout = float(cfg.get("mc_timeout") or 8)
+
+        # 重建共享 client，使地址/超时改动立即生效
+        _SHARED_CLIENT = MCClient(url, _state_file(), timeout=timeout)
+
+        chain: dict[str, dict] = {}
+
+        hist = self._resolve_provider(str(cfg.get("historian_provider_id") or "").strip())
+        if hist:
+            chain["historian"] = hist
+            _CFG["historian_model"] = hist.get("model") or ""
+        else:
+            _CFG["historian_model"] = ""
+
+        # dreamer 留空则沿用 historian
+        dreamer_pid = str(cfg.get("dreamer_provider_id") or "").strip()
+        dreamer = self._resolve_provider(dreamer_pid) if dreamer_pid else hist
+        if dreamer:
+            chain["dreamer"] = dreamer
+
+        emb_pid = str(cfg.get("embedding_provider_id") or "").strip()
+        emb = self._resolve_provider(emb_pid) if emb_pid else None
+        if emb:
+            chain["embedding"] = emb
+
+        if chain:
+            _write_llm_config(chain)
+        _CFG["models"] = {
+            k: v.get("model") or "" for k, v in chain.items()
+        }
+
+    def _resolve_provider(self, provider_id: str) -> dict | None:
+        """从 AstrBot 配置里解析所选模型的 base_url / key / model。"""
+        if not provider_id:
+            return None
+        try:
+            conf = self.context.get_config()
+            providers = conf.get("provider", []) or []
+            sources = conf.get("provider_sources", []) or []
+            item = next(
+                (p for p in providers if isinstance(p, dict) and p.get("id") == provider_id),
+                None,
+            )
+            if not item:
+                logger.warning("[mc] 找不到 provider: %s", provider_id)
+                return None
+            src_id = item.get("provider_source_id")
+            src = next(
+                (s for s in sources if isinstance(s, dict) and s.get("id") == src_id),
+                {},
+            )
+            key = src.get("key") or ""
+            if isinstance(key, list):
+                key = key[0] if key else ""
+            return {
+                "base_url": str(src.get("api_base") or ""),
+                "api_key": str(key),
+                "model": str(item.get("model") or ""),
+            }
+        except Exception as exc:
+            logger.warning("[mc] 解析 provider 失败: %s", exc)
+            return None
 
     @filter.on_llm_request()
     async def on_llm_request_mc(self, event, req) -> None:
